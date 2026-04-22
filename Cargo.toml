@@ -6,4 +6,8 @@ edition = "2024"
 [dependencies]
 softbuffer = "0.4"
 winit = "0.30"
+log = "0.4.28"
 scamu = { git = "https://github.com/insertokname/scamu" }
+
+[profile.dev]
+overflow-checks = false

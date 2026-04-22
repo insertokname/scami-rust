@@ -1,25 +1,60 @@
+#![allow(dead_code)]
+
+use scamu::devices::nes::Nes;
+use scamu::hardware::cartrige::Cartrige;
+use scamu::hardware::constants::controller::buttons;
+use scamu::hardware::constants::ppu::COLORS;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop};
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-const WIDTH: usize = 640;
-const HEIGHT: usize = 480;
-const TARGET_FPS: u64 = 240;
-const FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000u64 / TARGET_FPS);
+use crate::test_logger::TestLogger;
+
+pub mod test_logger;
+
+const PALLET_WIDTH: usize = 16 * 8;
+const PALLET_HEIGHT: usize = 16 * 8;
+const NAMETABLE_WIDTH: usize = 32 * 8;
+const NAMETABLE_HEIGHT: usize = 30 * 8;
+const INIT_WIDTH: usize = PALLET_WIDTH + NAMETABLE_WIDTH;
+const INIT_HEIGHT: usize = PALLET_HEIGHT * 2;
+const NES_PPU_TICKS_PER_FRAME: usize = 341 * 262;
+const TARGET_FPS: u64 = 60;
+const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS);
 
 type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
 
 struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface>,
-    start_time: Instant,
-    last_frame_time: Instant,
-    frame_count: u32,
-    fps_timer: Instant,
+    next_frame_time: Instant,
+    nes: Nes,
+    logical_buffer: [u32; INIT_WIDTH * INIT_HEIGHT],
+    surface_width: usize,
+    surface_height: usize,
+}
+
+fn scale_nearest(
+    src: &[u32],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u32],
+    dst_w: usize,
+    dst_h: usize,
+) {
+    for y in 0..dst_h {
+        let src_y = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let src_x = x * src_w / dst_w;
+            dst[y * dst_w + x] = src[src_y * src_w + src_x];
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -29,7 +64,14 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("SCAM")
-                        .with_inner_size(winit::dpi::LogicalSize::new(WIDTH as f64, HEIGHT as f64)),
+                        .with_min_inner_size(PhysicalSize::new(
+                            INIT_WIDTH as u32,
+                            INIT_HEIGHT as u32,
+                        ))
+                        .with_inner_size(winit::dpi::LogicalSize::new(
+                            INIT_WIDTH as f64,
+                            INIT_HEIGHT as f64,
+                        )),
                 )
                 .unwrap(),
         );
@@ -40,12 +82,24 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.surface = Some(surface);
 
-        let now = Instant::now();
-        self.last_frame_time = now;
-        self.fps_timer = now;
+        self.next_frame_time = Instant::now() + FRAME_DURATION;
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
 
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.window {
+            let now = Instant::now();
+            if now >= self.next_frame_time {
+                window.request_redraw();
+                while self.next_frame_time <= now {
+                    self.next_frame_time += FRAME_DURATION;
+                }
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
         }
     }
 
@@ -56,7 +110,7 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         let window = match &self.window {
-            Some(window) if window.id() == window_id => window,
+            Some(window) if window.id() == window_id => window.clone(),
             _ => return,
         };
 
@@ -70,101 +124,152 @@ impl ApplicationHandler for App {
                         (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                     {
                         surface.resize(width, height).unwrap();
+                        self.surface_height = size.height as usize;
                     }
+                    self.surface_width = size.width as usize;
                 }
                 window.request_redraw();
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyL),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                println!("{:X}", self.nes.ppu.borrow_mut().control_register);
+                let logs = NESTEST_TEST_LOGGER._logs.read().unwrap();
+                std::fs::write(
+                    r"C:\Users\fekete\Documents\actual-projects\SCAM\scami-rust\log.txt",
+                    logs.as_str(),
+                )
+                .unwrap();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: code,
+                        state,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+
+                if let PhysicalKey::Code(keycode) = code {
+                    if self.handle_controller_key(keycode, pressed) {
+                        return;
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
-                let frame_start = Instant::now();
-                let delta = frame_start.saturating_duration_since(self.last_frame_time);
-
-                if let Some(surface) = &mut self.surface {
-                    let size = window.inner_size();
-                    if let (Some(_), Some(_)) =
-                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                    {
-                        let time = self.start_time.elapsed().as_secs_f32();
-                        let red = ((time.sin() * 0.5 + 0.5) * 255.0) as u32;
-                        let green = (((time + 2.094).sin() * 0.5 + 0.5) * 255.0) as u32;
-                        let blue = (((time + 4.188).sin() * 0.5 + 0.5) * 255.0) as u32;
-                        let color = (red << 16) | (green << 8) | blue;
-
-                        if let Ok(mut buffer) = surface.buffer_mut() {
-                            buffer.fill(color);
-                            let _ = buffer.present();
-                        }
-                    }
-                }
-
-                let scheduled_next_start = self.last_frame_time + FRAME_TIME;
-                if frame_start < scheduled_next_start {
-                    let remaining = scheduled_next_start - frame_start;
-
-                    if remaining > Duration::from_micros(500) {
-                        let coarse = remaining - Duration::from_micros(200);
-                        std::thread::sleep(coarse);
-                    }
-                    while Instant::now() < scheduled_next_start {
-                        std::hint::spin_loop();
-                    }
-                    self.last_frame_time = scheduled_next_start;
-                } else {
-                    self.last_frame_time = frame_start;
-                }
-
-                self.frame_count += 1;
-                let now_stats = Instant::now();
-                if now_stats.duration_since(self.fps_timer) >= Duration::from_secs(1) {
-                    let avg_ms = (now_stats - self.fps_timer).as_secs_f64() * 1000.0
-                        / self.frame_count as f64;
-                    println!(
-                        "FPS: {} | avg frame {:.3} ms | last delta {:.3} ms",
-                        self.frame_count,
-                        avg_ms,
-                        delta.as_secs_f64() * 1000.0
-                    );
-                    self.frame_count = 0;
-                    self.fps_timer = now_stats;
-                }
-
-                window.request_redraw();
+                self.render_frame(&window);
             }
             _ => {}
         }
     }
 }
 
-fn main() {
-    // let event_loop = EventLoop::new().unwrap();
+impl App {
+    fn handle_controller_key(&mut self, key: KeyCode, pressed: bool) -> bool {
+        let button = match key {
+            KeyCode::KeyW => Some(buttons::UP),
+            KeyCode::ArrowUp => Some(buttons::UP),
+            KeyCode::KeyA => Some(buttons::LEFT),
+            KeyCode::ArrowLeft => Some(buttons::LEFT),
+            KeyCode::KeyS => Some(buttons::DOWN),
+            KeyCode::ArrowDown => Some(buttons::DOWN),
+            KeyCode::KeyD => Some(buttons::RIGHT),
+            KeyCode::ArrowRight => Some(buttons::RIGHT),
+            KeyCode::KeyZ => Some(buttons::A),
+            KeyCode::KeyJ => Some(buttons::A),
+            KeyCode::KeyX => Some(buttons::B),
+            KeyCode::KeyK => Some(buttons::B),
+            KeyCode::KeyC => Some(buttons::START),
+            KeyCode::Enter => Some(buttons::START),
+            KeyCode::KeyV => Some(buttons::SELECT),
+            KeyCode::ShiftRight => Some(buttons::SELECT),
+            _ => None,
+        };
 
-    // let now = Instant::now();
-    // let mut app = App {
-    //     window: None,
-    //     surface: None,
-    //     start_time: now,
-    //     last_frame_time: now,
-    //     frame_count: 0,
-    //     fps_timer: now,
-    // };
+        if let Some(button) = button {
+            self.nes.bus.set_controller_button(0, button, pressed);
+            return true;
+        }
 
-    // event_loop.run_app(&mut app).unwrap();
-
-    // println!("{}", 1 << 6 == 0x60)
-    let mut nes = scamu::device::nes::Nes::new();
-    nes.write_memory(
-        0x8000,
-        &[
-            0xA9, 0x00, 0x85, 0x00, 0xA9, 0x01, 0x85, 0x01, 0xA2, 0x00, 0xB5, 0x00, 0x18, 0x75,
-            0x01, 0x95, 0x02, 0xE8, 0x90, 0xF6, 0xE8,
-        ],
-    );
-
-    nes.write_memory(0xFFFC, &[0x00, 0x80]);
-
-    nes.reset();
-
-
-    loop {
-        nes.tick();
+        false
     }
+
+    fn render_frame(&mut self, window: &Rc<Window>) {
+        if let Some(surface) = &mut self.surface {
+            let size = window.inner_size();
+            if let (Some(_), Some(_)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+            {
+                let mut buffer = match surface.buffer_mut() {
+                    Ok(buffer) => buffer,
+                    Err(..) => return,
+                };
+
+                for _ in 0..NES_PPU_TICKS_PER_FRAME {
+                    let out = self.nes.tick();
+                    if let Some(pix) = out {
+                        let color_index = self
+                            .nes
+                            .ppu
+                            .borrow()
+                            .pallet_memory
+                            .read_index(pix.3 as u16, pix.2 as u16)
+                            as usize;
+                        let color = COLORS[color_index];
+                        self.logical_buffer[pix.1 as usize * INIT_WIDTH + pix.0 as usize] = color;
+                    }
+                }
+
+                scale_nearest(
+                    &self.logical_buffer,
+                    INIT_WIDTH,
+                    INIT_HEIGHT,
+                    &mut buffer,
+                    self.surface_width,
+                    self.surface_height,
+                );
+                let _ = buffer.present();
+            }
+        }
+    }
+}
+
+static NESTEST_TEST_LOGGER: TestLogger = TestLogger::new();
+
+fn main() {
+    // log::set_logger(&NESTEST_TEST_LOGGER).unwrap();
+    // log::set_max_level(log::LevelFilter::Trace);
+
+    let event_loop = EventLoop::new().unwrap();
+
+    let now = Instant::now();
+    let mut app = App {
+        window: None,
+        surface: None,
+        next_frame_time: now + FRAME_DURATION,
+        nes: Nes::new(),
+        logical_buffer: [0; INIT_WIDTH * INIT_HEIGHT],
+        surface_width: INIT_WIDTH,
+        surface_height: INIT_HEIGHT,
+    };
+
+    let cartrige = Cartrige::from_bytes(include_bytes!("./nestest.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/smb.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/dk.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/ic.nes")).unwrap();
+
+    app.nes.insert_cartrige(cartrige);
+    app.nes.reset();
+
+    event_loop.run_app(&mut app).unwrap();
+
 }
