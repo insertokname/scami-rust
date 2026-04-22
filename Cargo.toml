@@ -7,7 +7,7 @@ edition = "2024"
 softbuffer = "0.4"
 winit = "0.30"
 log = "0.4.28"
-scamu = { git = "https://github.com/insertokname/scamu" }
+scamu = { git = "https://github.com/insertokname/scamu", version="0.1" }
 
 [profile.dev]
 overflow-checks = false
