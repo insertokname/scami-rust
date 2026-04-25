@@ -133,24 +133,6 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyL),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                println!("{:X}", self.nes.ppu.borrow_mut().control_register);
-                let logs = NESTEST_TEST_LOGGER._logs.read().unwrap();
-                std::fs::write(
-                    r"C:\Users\fekete\Documents\actual-projects\SCAM\scami-rust\log.txt",
-                    logs.as_str(),
-                )
-                .unwrap();
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
                         physical_key: code,
                         state,
                         repeat: false,
@@ -262,11 +244,13 @@ fn main() {
         surface_height: INIT_HEIGHT,
     };
 
-    let cartrige = Cartrige::from_bytes(include_bytes!("./nestest.nes")).unwrap();
-    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/smb.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./nestest.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./AccuracyCoin.nes")).unwrap();
+    let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/smb.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/pacman.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/dk.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/ic.nes")).unwrap();
-
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/tetris-73.nes")).unwrap();
     app.nes.insert_cartrige(cartrige);
     app.nes.reset();
 
