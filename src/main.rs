@@ -1,11 +1,13 @@
 #![allow(dead_code)]
 
+use rodio::source::{SawtoothWave, SquareWave, TriangleWave};
 use scamu::devices::nes::Nes;
 use scamu::hardware::cartrige::Cartrige;
 use scamu::hardware::constants::controller::buttons;
 use scamu::hardware::constants::ppu::COLORS;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -228,6 +230,30 @@ impl App {
 static NESTEST_TEST_LOGGER: TestLogger = TestLogger::new();
 
 fn main() {
+    // use rodio::source::{SineWave, Source};
+    // use rodio::{MixerDeviceSink, Player};
+    // use std::time::Duration;
+
+    // // _stream must live as long as the sink
+    // let handle = rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
+    // let player = rodio::Player::connect_new(&handle.mixer());
+
+    // // Add a dummy source of the sake of the example.
+    // let source = SawtoothWave::new(500.0).amplify(0.2);
+    // player.append(source);
+
+    // player
+
+    // // source.amplify(0.5);
+
+    // // The sound plays in a separate thread. This call will block the current thread until the
+    // // player has finished playing all its queued sounds.
+    // // player.sleep_until_end();
+
+    // thread::sleep(Duration::from_secs(5));
+
+    // player.stop();
+
     // log::set_logger(&NESTEST_TEST_LOGGER).unwrap();
     // log::set_max_level(log::LevelFilter::Trace);
 
@@ -255,5 +281,4 @@ fn main() {
     app.nes.reset();
 
     event_loop.run_app(&mut app).unwrap();
-
 }
