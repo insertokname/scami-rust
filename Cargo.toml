@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-softbuffer = "0.4"
+pixels = "0.15"
 winit = "0.30"
 log = "0.4.28"
 scamu = { git = "https://github.com/insertokname/scamu", version="0.1" }

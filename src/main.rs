@@ -1,17 +1,15 @@
 #![allow(dead_code)]
 
-use rodio::source::{SawtoothWave, SquareWave, TriangleWave};
 use scamu::devices::nes::Nes;
 use scamu::hardware::cartrige::Cartrige;
 use scamu::hardware::constants::controller::buttons;
 use scamu::hardware::constants::ppu::COLORS;
-use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::thread;
+use pixels::{Pixels, SurfaceTexture};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -26,42 +24,40 @@ const NAMETABLE_WIDTH: usize = 32 * 8;
 const NAMETABLE_HEIGHT: usize = 30 * 8;
 const INIT_WIDTH: usize = PALLET_WIDTH + NAMETABLE_WIDTH;
 const INIT_HEIGHT: usize = PALLET_HEIGHT * 2;
-const NES_PPU_TICKS_PER_FRAME: usize = 341 * 262;
-const TARGET_FPS: u64 = 60;
-const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS);
-
-type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
+const NES_MASTER_CLOCK_HZ: u64 = 21_477_272;
+const MASTER_CLOCKS_PER_NES_TICK: u64 = 4;
+const NES_TICK_HZ: u64 = NES_MASTER_CLOCK_HZ / MASTER_CLOCKS_PER_NES_TICK;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const LAST_VISIBLE_X: u32 = 255;
+const LAST_VISIBLE_Y: u32 = 239;
+const RUN_UNCAPPED: bool = false;
 
 struct App {
-    window: Option<Rc<Window>>,
-    surface: Option<Surface>,
-    next_frame_time: Instant,
+    window: Option<Arc<Window>>,
+    pixels: Option<Pixels<'static>>,
+    emulation_anchor: Instant,
+    completed_ticks: u64,
+    next_tick_deadline: Instant,
     nes: Nes,
-    logical_buffer: [u32; INIT_WIDTH * INIT_HEIGHT],
-    surface_width: usize,
-    surface_height: usize,
-}
-
-fn scale_nearest(
-    src: &[u32],
-    src_w: usize,
-    src_h: usize,
-    dst: &mut [u32],
-    dst_w: usize,
-    dst_h: usize,
-) {
-    for y in 0..dst_h {
-        let src_y = y * src_h / dst_h;
-        for x in 0..dst_w {
-            let src_x = x * src_w / dst_w;
-            dst[y * dst_w + x] = src[src_y * src_w + src_x];
-        }
-    }
+    draw_buffer: [u8; INIT_WIDTH * INIT_HEIGHT * 4],
+    latched_buffer: [u8; INIT_WIDTH * INIT_HEIGHT * 4],
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        match cause {
+            StartCause::Init
+            | StartCause::ResumeTimeReached { .. }
+            | StartCause::WaitCancelled { .. }
+            | StartCause::Poll => {
+                self.run_due_ticks();
+                self.configure_control_flow(event_loop);
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = Rc::new(
+        let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
@@ -78,14 +74,33 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
 
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
+        let initial_size = window.inner_size();
+        let surface_texture = SurfaceTexture::new(
+            initial_size.width.max(1),
+            initial_size.height.max(1),
+            window.clone(),
+        );
+        let mut pixels = Pixels::new(
+            INIT_WIDTH as u32,
+            INIT_HEIGHT as u32,
+            surface_texture,
+        )
+        .unwrap();
+        if RUN_UNCAPPED {
+            pixels.enable_vsync(false);
+        } else {
+            pixels.enable_vsync(true);
+            pixels.set_present_mode(pixels::wgpu::PresentMode::Fifo);
+        }
 
         self.window = Some(window);
-        self.surface = Some(surface);
+        self.pixels = Some(pixels);
 
-        self.next_frame_time = Instant::now() + FRAME_DURATION;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
+        self.emulation_anchor = Instant::now();
+        self.completed_ticks = 0;
+        self.next_tick_deadline = self.deadline_for_tick(1);
+
+        self.configure_control_flow(event_loop);
 
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -93,16 +108,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            let now = Instant::now();
-            if now >= self.next_frame_time {
-                window.request_redraw();
-                while self.next_frame_time <= now {
-                    self.next_frame_time += FRAME_DURATION;
-                }
-            }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_time));
-        }
+        self.configure_control_flow(event_loop);
     }
 
     fn window_event(
@@ -121,14 +127,11 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(surface) = &mut self.surface {
-                    if let (Some(width), Some(height)) =
-                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                    {
-                        surface.resize(width, height).unwrap();
-                        self.surface_height = size.height as usize;
-                    }
-                    self.surface_width = size.width as usize;
+                if size.width > 0
+                    && size.height > 0
+                    && let Some(pixels) = &mut self.pixels
+                {
+                    let _ = pixels.resize_surface(size.width, size.height);
                 }
                 window.request_redraw();
             }
@@ -151,7 +154,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.render_frame(&window);
+                self.present_buffer();
             }
             _ => {}
         }
@@ -159,6 +162,72 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn configure_control_flow(&self, event_loop: &ActiveEventLoop) {
+        if RUN_UNCAPPED {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick_deadline));
+        }
+    }
+
+    fn deadline_for_tick(&self, tick_number: u64) -> Instant {
+        let nanos = (tick_number as u128 * NANOS_PER_SECOND) / NES_TICK_HZ as u128;
+        self.emulation_anchor + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+    }
+
+    fn tick_once(&mut self) -> bool {
+        let out = self.nes.tick();
+        self.completed_ticks = self.completed_ticks.saturating_add(1);
+
+        if let Some((x, y, pattern, attrib)) = out {
+            let color_index = self
+                .nes
+                .ppu
+                .borrow()
+                .pallet_memory
+                .read_index(attrib as u16, pattern as u16) as usize;
+
+            let color = COLORS[color_index];
+            let i = (y as usize * INIT_WIDTH + x as usize) * 4;
+            self.draw_buffer[i] = ((color >> 16) & 0xFF) as u8;
+            self.draw_buffer[i + 1] = ((color >> 8) & 0xFF) as u8;
+            self.draw_buffer[i + 2] = (color & 0xFF) as u8;
+            self.draw_buffer[i + 3] = 0xFF;
+
+            if x == LAST_VISIBLE_X && y == LAST_VISIBLE_Y {
+                std::mem::swap(&mut self.draw_buffer, &mut self.latched_buffer);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn run_due_ticks(&mut self) {
+        if self.window.is_none() {
+            return;
+        }
+
+        if RUN_UNCAPPED {
+            while !self.tick_once() {}
+            return;
+        }
+
+        let elapsed_nanos = Instant::now()
+            .saturating_duration_since(self.emulation_anchor)
+            .as_nanos();
+        let target_ticks = (elapsed_nanos * NES_TICK_HZ as u128 / NANOS_PER_SECOND) as u64;
+
+        while self.completed_ticks < target_ticks {
+            self.tick_once();
+        }
+
+        self.next_tick_deadline = self.deadline_for_tick(self.completed_ticks + 1);
+    }
+
     fn handle_controller_key(&mut self, key: KeyCode, pressed: bool) -> bool {
         let button = match key {
             KeyCode::KeyW => Some(buttons::UP),
@@ -188,41 +257,11 @@ impl App {
         false
     }
 
-    fn render_frame(&mut self, window: &Rc<Window>) {
-        if let Some(surface) = &mut self.surface {
-            let size = window.inner_size();
-            if let (Some(_), Some(_)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-            {
-                let mut buffer = match surface.buffer_mut() {
-                    Ok(buffer) => buffer,
-                    Err(..) => return,
-                };
-
-                for _ in 0..NES_PPU_TICKS_PER_FRAME {
-                    let out = self.nes.tick();
-                    if let Some(pix) = out {
-                        let color_index = self
-                            .nes
-                            .ppu
-                            .borrow()
-                            .pallet_memory
-                            .read_index(pix.3 as u16, pix.2 as u16)
-                            as usize;
-                        let color = COLORS[color_index];
-                        self.logical_buffer[pix.1 as usize * INIT_WIDTH + pix.0 as usize] = color;
-                    }
-                }
-
-                scale_nearest(
-                    &self.logical_buffer,
-                    INIT_WIDTH,
-                    INIT_HEIGHT,
-                    &mut buffer,
-                    self.surface_width,
-                    self.surface_height,
-                );
-                let _ = buffer.present();
-            }
+    fn present_buffer(&mut self) {
+        if let Some(pixels) = &mut self.pixels {
+            let frame = pixels.frame_mut();
+            frame.copy_from_slice(&self.latched_buffer);
+            let _ = pixels.render();
         }
     }
 }
@@ -231,7 +270,6 @@ static NESTEST_TEST_LOGGER: TestLogger = TestLogger::new();
 
 fn main() {
     // use rodio::source::{SineWave, Source};
-    // use rodio::{MixerDeviceSink, Player};
     // use std::time::Duration;
 
     // // _stream must live as long as the sink
@@ -239,10 +277,10 @@ fn main() {
     // let player = rodio::Player::connect_new(&handle.mixer());
 
     // // Add a dummy source of the sake of the example.
-    // let source = SawtoothWave::new(500.0).amplify(0.2);
+    // let source = SineWave::new(200.0).amplify(0.1);
     // player.append(source);
 
-    // player
+    // // player
 
     // // source.amplify(0.5);
 
@@ -262,12 +300,13 @@ fn main() {
     let now = Instant::now();
     let mut app = App {
         window: None,
-        surface: None,
-        next_frame_time: now + FRAME_DURATION,
+        pixels: None,
+        emulation_anchor: now,
+        completed_ticks: 0,
+        next_tick_deadline: now,
         nes: Nes::new(),
-        logical_buffer: [0; INIT_WIDTH * INIT_HEIGHT],
-        surface_width: INIT_WIDTH,
-        surface_height: INIT_HEIGHT,
+        draw_buffer: [0; INIT_WIDTH * INIT_HEIGHT * 4],
+        latched_buffer: [0; INIT_WIDTH * INIT_HEIGHT * 4],
     };
 
     // let cartrige = Cartrige::from_bytes(include_bytes!("./nestest.nes")).unwrap();
