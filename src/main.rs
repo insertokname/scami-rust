@@ -1,11 +1,13 @@
-#![allow(dead_code)]
-
+use pixels::{Pixels, SurfaceTexture};
+use rodio::Source;
 use scamu::devices::nes::Nes;
+use scamu::hardware::apu::Apu;
 use scamu::hardware::cartrige::Cartrige;
+use scamu::hardware::constants::clock_rates;
 use scamu::hardware::constants::controller::buttons;
 use scamu::hardware::constants::ppu::COLORS;
-use pixels::{Pixels, SurfaceTexture};
-use std::sync::Arc;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -14,23 +16,57 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::test_logger::TestLogger;
-
 pub mod test_logger;
 
 const PALLET_WIDTH: usize = 16 * 8;
 const PALLET_HEIGHT: usize = 16 * 8;
 const NAMETABLE_WIDTH: usize = 32 * 8;
-const NAMETABLE_HEIGHT: usize = 30 * 8;
 const INIT_WIDTH: usize = PALLET_WIDTH + NAMETABLE_WIDTH;
 const INIT_HEIGHT: usize = PALLET_HEIGHT * 2;
-const NES_MASTER_CLOCK_HZ: u64 = 21_477_272;
 const MASTER_CLOCKS_PER_NES_TICK: u64 = 4;
-const NES_TICK_HZ: u64 = NES_MASTER_CLOCK_HZ / MASTER_CLOCKS_PER_NES_TICK;
+const NES_TICK_HZ: u64 = clock_rates::MASTER_CLOCK / MASTER_CLOCKS_PER_NES_TICK;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const LAST_VISIBLE_X: u32 = 255;
 const LAST_VISIBLE_Y: u32 = 239;
 const RUN_UNCAPPED: bool = false;
+
+#[derive(Default, Clone)]
+struct ApuSource {
+    last_val: f32,
+    apu: Option<Arc<Mutex<Apu>>>,
+}
+
+impl Iterator for ApuSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let val = self
+            .apu
+            .as_ref()
+            .and_then(|a| a.lock().unwrap().next())
+            .unwrap_or(self.last_val);
+        self.last_val = val;
+        Some(val)
+    }
+}
+
+impl Source for ApuSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        NonZeroU16::new(1).unwrap()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        NonZeroU32::new(44_100).unwrap()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -39,6 +75,7 @@ struct App {
     completed_ticks: u64,
     next_tick_deadline: Instant,
     nes: Nes,
+    apu_source: ApuSource,
     draw_buffer: [u8; INIT_WIDTH * INIT_HEIGHT * 4],
     latched_buffer: [u8; INIT_WIDTH * INIT_HEIGHT * 4],
 }
@@ -80,12 +117,8 @@ impl ApplicationHandler for App {
             initial_size.height.max(1),
             window.clone(),
         );
-        let mut pixels = Pixels::new(
-            INIT_WIDTH as u32,
-            INIT_HEIGHT as u32,
-            surface_texture,
-        )
-        .unwrap();
+        let mut pixels =
+            Pixels::new(INIT_WIDTH as u32, INIT_HEIGHT as u32, surface_texture).unwrap();
         if RUN_UNCAPPED {
             pixels.enable_vsync(false);
         } else {
@@ -266,34 +299,9 @@ impl App {
     }
 }
 
-static NESTEST_TEST_LOGGER: TestLogger = TestLogger::new();
-
 fn main() {
-    // use rodio::source::{SineWave, Source};
-    // use std::time::Duration;
-
-    // // _stream must live as long as the sink
-    // let handle = rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
-    // let player = rodio::Player::connect_new(&handle.mixer());
-
-    // // Add a dummy source of the sake of the example.
-    // let source = SineWave::new(200.0).amplify(0.1);
-    // player.append(source);
-
-    // // player
-
-    // // source.amplify(0.5);
-
-    // // The sound plays in a separate thread. This call will block the current thread until the
-    // // player has finished playing all its queued sounds.
-    // // player.sleep_until_end();
-
-    // thread::sleep(Duration::from_secs(5));
-
-    // player.stop();
-
-    // log::set_logger(&NESTEST_TEST_LOGGER).unwrap();
-    // log::set_max_level(log::LevelFilter::Trace);
+    let handle = rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
+    let player = rodio::Player::connect_new(&handle.mixer());
 
     let event_loop = EventLoop::new().unwrap();
 
@@ -305,17 +313,22 @@ fn main() {
         completed_ticks: 0,
         next_tick_deadline: now,
         nes: Nes::new(),
+        apu_source: ApuSource::default(),
         draw_buffer: [0; INIT_WIDTH * INIT_HEIGHT * 4],
         latched_buffer: [0; INIT_WIDTH * INIT_HEIGHT * 4],
     };
 
+    app.apu_source.apu = Some(app.nes.apu.clone());
+    player.append(app.apu_source.clone());
+
     // let cartrige = Cartrige::from_bytes(include_bytes!("./nestest.nes")).unwrap();
-    // let cartrige = Cartrige::from_bytes(include_bytes!("./AccuracyCoin.nes")).unwrap();
+    // let cartrige = Cartrige::from_bytes(include_bytes!("./AccuracyCoin.nes")).unwrap(); //77 tests passed last time
     let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/smb.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/pacman.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/dk.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/ic.nes")).unwrap();
     // let cartrige = Cartrige::from_bytes(include_bytes!("./gitignored_games/tetris-73.nes")).unwrap();
+
     app.nes.insert_cartrige(cartrige);
     app.nes.reset();
 

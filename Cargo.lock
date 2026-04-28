@@ -166,6 +166,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "blip_buf"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d01761ce5061c5345c211c47958ee76989241021a9e3c16d3c0a35a309462fb5"
+
+[[package]]
 name = "block"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,8 +1863,8 @@ dependencies = [
 [[package]]
 name = "scamu"
 version = "0.1.0"
-source = "git+https://github.com/insertokname/scamu#0b20b84c64ca04acc806a852e8b0e7975571331d"
 dependencies = [
+ "blip_buf",
  "funty",
  "log",
  "thiserror 2.0.18",
